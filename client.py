@@ -3,64 +3,54 @@ import json
 import threading
 import omni.usd
 import omni.kit.app
-from pxr import Gf, UsdGeom, Sdf
+from pxr import Gf, UsdGeom
 
 # ====== KONFIGURACJA ======
-HOST = "192.168.1.235"  # IP Laptopa
+HOST = "192.168.1.129" 
 PORT = 5005
+CAMERA_PATH = "/World/Camera" 
 
-# Pozycja bazowa kamery
-START_POS = Gf.Vec3d(0.0, 150.0, 500.0) 
+# --- KALIBRACJA RUCHU ---
+TRANSLATION_SCALE_XY = 0.2  
+TRANSLATION_SCALE_Z = 1.0  # Duża czułość głębi
 
-# --- CZUŁOŚĆ RUCHU (Nowe ustawienia) ---
-# Skala dla ruchu lewo/prawo i góra/dół
-TRANSLATION_SCALE_XY = 0.03 
+BASE_FACE_SIZE = 65.0       # Wielkość twarzy "w spoczynku" (wyreguluj to patrząc w konsolę)
 
-# Skala dla ruchu przód/tył (GŁĘBIA)
-# Zwiększ to, jeśli chcesz mocniejszy efekt przybliżania przy pochylaniu głowy.
-TRANSLATION_SCALE_Z = 0.08  
-
-# Czułość obrotu
-ROTATION_SCALE = 0.015
-
-# --- OPCJE RUCHU ---
-# Czy odwrócić oś poziomą? (True = inwersja, False = normalnie)
-INVERT_X_AXIS = True 
-
-# --- OGRANICZENIA (Limity) ---
-MAX_OFFSET_X = 80.0
-MAX_OFFSET_Y = 50.0
-MAX_OFFSET_Z = 150.0  # Zwiększone, żebyś mógł mocno się przybliżyć/oddalić
-MAX_ROT_PITCH = 5.0 
-MAX_ROT_YAW = 8.0   
-
-# --- WYGŁADZANIE ---
-SMOOTH_FACTOR = 0.06
+# --- WYGŁADZANIE (ANTY-DRGANIA) ---
+SMOOTH_FACTOR = 0.05        # Zmniejszyłem na 0.05 (wolniejszy, bardziej "filmowy" ruch)
+Z_HISTORY_FRAMES = 20       # Średnia z ilu klatek? (Im więcej, tym mniej drgań, ale wolniejsza reakcja na zoom)
 
 # ====== ZMIENNE ======
-current_head_data = None
+current_head_data = {"found": False}
 data_lock = threading.Lock()
+sock = None
+running = True
+
+START_POS = Gf.Vec3d(0, 50, 300) 
 smooth_pos = START_POS
-smooth_rot = Gf.Vec3d(0, 0, 0)
+target_pos_memory = START_POS 
 
-# ====== SIECIOWE ======
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-try:
-    sock.connect((HOST, PORT))
-    print(f"✅ Połączono: {HOST}:{PORT}")
-except Exception as e:
-    print(f"❌ Błąd połączenia: {e}")
-    sock = None
+# Bufor historii dla osi Z (żeby usunąć szum)
+z_history = [] 
 
-def network_listener():
-    global current_head_data
+# ====== WĄTEK SIECIOWY ======
+def network_thread():
+    global current_head_data, sock
+    print(f"🔌 Łączenie z {HOST}...")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.connect((HOST, PORT))
+        print("✅ POŁĄCZONO!")
+    except Exception as e:
+        print(f"❌ Błąd: {e}")
+        return
+
     buffer = ""
-    if not sock: return
-    while True:
+    while running:
         try:
-            data = sock.recv(1024).decode()
-            if not data: break
-            buffer += data
+            chunk = sock.recv(1024).decode()
+            if not chunk: break
+            buffer += chunk
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
                 try:
@@ -70,115 +60,87 @@ def network_listener():
                 except: pass
         except: break
 
-if sock:
-    threading.Thread(target=network_listener, daemon=True).start()
-
-# ====== FUNKCJE POMOCNICZE ======
-def clamp(n, minn, maxn):
-    return max(min(n, maxn), minn)
-
-def vec_lerp(v1, v2, t):
-    return Gf.Vec3d(
-        v1[0] + (v2[0] - v1[0]) * t,
-        v1[1] + (v2[1] - v1[1]) * t,
-        v1[2] + (v2[2] - v1[2]) * t
-    )
+threading.Thread(target=network_thread, daemon=True).start()
 
 # ====== SETUP KAMERY ======
-def setup_camera_ops():
+def get_camera_ops():
     stage = omni.usd.get_context().get_stage()
     if not stage: return None, None
-    camera_prim = stage.GetPrimAtPath("/World/Camera")
-    if not camera_prim: return None, None
-
-    xform = UsdGeom.Xformable(camera_prim)
-    
+    prim = stage.GetPrimAtPath(CAMERA_PATH)
+    if not prim.IsValid(): return None, None
+    xform = UsdGeom.Xformable(prim)
     translate_op = None
-    rotate_op = None
-    scale_op = None 
-
     for op in xform.GetOrderedXformOps():
         if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
             translate_op = op
-        elif op.GetOpType() == UsdGeom.XformOp.TypeRotateXYZ:
-            rotate_op = op
-        elif op.GetOpType() == UsdGeom.XformOp.TypeScale:
-            scale_op = op
-
+            break
     if not translate_op: translate_op = xform.AddTranslateOp()
-    if not rotate_op: rotate_op = xform.AddRotateXYZOp()
-    
-    new_order = [translate_op, rotate_op]
-    if scale_op:
-        new_order.append(scale_op)
-        
-    xform.SetXformOpOrder(new_order)
-    return translate_op, rotate_op
+    return translate_op, None
 
 # Inicjalizacja
-cam_trans_op, cam_rot_op = setup_camera_ops()
+cam_trans, _ = get_camera_ops()
+if cam_trans:
+    START_POS = cam_trans.Get()
+    smooth_pos = START_POS
+    target_pos_memory = START_POS
 
-# ====== UPDATE LOOP ======
+# ====== PĘTLA UPDATE ======
 def on_update(e):
-    global current_head_data, smooth_pos, smooth_rot, cam_trans_op, cam_rot_op
-    
-    if cam_trans_op is None or cam_rot_op is None:
-        cam_trans_op, cam_rot_op = setup_camera_ops()
-        if cam_trans_op is None: return
+    global smooth_pos, target_pos_memory, z_history
 
     target_data = None
     with data_lock:
-        if current_head_data: target_data = current_head_data
+        target_data = current_head_data.copy()
     
-    if not target_data: return
+    if target_data.get("found", False):
+        raw_x = float(target_data.get("x", 0))
+        raw_y = float(target_data.get("y", 0))
+        raw_z = float(target_data.get("z", 0)) 
 
-    # Pobieranie danych
-    raw_x = float(target_data.get("x", 0))
-    raw_y = float(target_data.get("y", 0))
-    raw_z = float(target_data.get("z", 0)) # Odległość głowy
-    raw_pitch = float(target_data.get("pitch", 0))
-    raw_yaw = float(target_data.get("yaw", 0))
+        # --- ALGORYTM USUWANIA DRGAŃ (ŚREDNIA KROCZĄCA) ---
+        # 1. Dodajemy nowy wynik do listy
+        z_history.append(raw_z)
+        
+        # 2. Jeśli lista jest za długa, usuwamy najstarszy wynik
+        if len(z_history) > Z_HISTORY_FRAMES:
+            z_history.pop(0)
+            
+        # 3. Obliczamy średnią z całej listy
+        avg_z = sum(z_history) / len(z_history)
 
-    # --- OBLICZENIA POZYCJI ---
-    
-    # 1. Oś X (Inwersja)
-    val_x = -raw_x if INVERT_X_AXIS else raw_x
-    offset_x = clamp(val_x * TRANSLATION_SCALE_XY, -MAX_OFFSET_X, MAX_OFFSET_X)
-    
-    # 2. Oś Y (Góra/Dół - zazwyczaj odwrócona w USD)
-    offset_y = clamp(-raw_y * TRANSLATION_SCALE_XY, -MAX_OFFSET_Y, MAX_OFFSET_Y)
-    
-    # 3. Oś Z (Głębia / Przód-Tył)
-    # raw_z to odległość w mm (dużo = daleko, mało = blisko).
-    # Omniverse Z: mniejsze Z = bliżej (do przodu).
-    # Więc zależność jest prosta (więcej = dalej), ale musimy to przeskalować.
-    offset_z = clamp(raw_z * TRANSLATION_SCALE_Z, -MAX_OFFSET_Z, MAX_OFFSET_Z)
+        # --------------------------------------------------
+        
+        # Teraz używamy avg_z zamiast raw_z do obliczeń
+        diff_z = avg_z - BASE_FACE_SIZE
+        offset_z = -(diff_z * TRANSLATION_SCALE_Z)
 
-    target_pos = START_POS + Gf.Vec3d(offset_x, offset_y, offset_z)
+        off_x = -raw_x * TRANSLATION_SCALE_XY
+        off_y = -raw_y * TRANSLATION_SCALE_XY
 
-    # --- OBLICZENIA ROTACJI ---
-    t_pitch = clamp(raw_pitch * ROTATION_SCALE, -MAX_ROT_PITCH, MAX_ROT_PITCH)
-    t_yaw = clamp(raw_yaw * ROTATION_SCALE, -MAX_ROT_YAW, MAX_ROT_YAW)
-    
-    target_rot = Gf.Vec3d(t_pitch, t_yaw, 0)
+        target_pos_memory = Gf.Vec3d(
+            START_POS[0] + off_x,
+            START_POS[1] + off_y,
+            START_POS[2] + offset_z 
+        )
+    else:
+        # Opcjonalnie: Jeśli zgubimy twarz, czyścimy historię, żeby nie "pamiętała" starych danych przy powrocie
+        # Ale nie resetujemy pozycji kamery (efekt Freeze)
+        if len(z_history) > 0:
+            z_history.clear()
 
-    # Wygładzanie
-    smooth_pos = vec_lerp(smooth_pos, target_pos, SMOOTH_FACTOR)
-    smooth_rot = vec_lerp(smooth_rot, target_rot, SMOOTH_FACTOR)
+    # Wygładzanie (Lerp)
+    smooth_pos = Gf.Vec3d(
+        smooth_pos[0] + (target_pos_memory[0] - smooth_pos[0]) * SMOOTH_FACTOR,
+        smooth_pos[1] + (target_pos_memory[1] - smooth_pos[1]) * SMOOTH_FACTOR,
+        smooth_pos[2] + (target_pos_memory[2] - smooth_pos[2]) * SMOOTH_FACTOR
+    )
 
-    try:
-        cam_trans_op.Set(smooth_pos)
-        cam_rot_op.Set(smooth_rot)
-    except Exception:
-        cam_trans_op = None
-        cam_rot_op = None
+    trans_op, _ = get_camera_ops()
+    if trans_op:
+        trans_op.Set(smooth_pos)
 
-# ====== START ======
-try: 
-    if _update_sub: _update_sub = None
+try: _sub = None 
 except: pass
-
 app = omni.kit.app.get_app()
-_update_sub = app.get_update_event_stream().create_subscription_to_pop(on_update)
-
-print(f"✅ Tryb: Inverted X + Depth Z.")
+_sub = app.get_update_event_stream().create_subscription_to_pop(on_update)
+print("🚀 STABILIZACJA WŁĄCZONA (Anti-Jitter)")
