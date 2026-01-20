@@ -2,100 +2,105 @@ import socket
 import json
 import cv2
 import time
+import numpy as np
 
-# ====== KONFIGURACJA SIECI ======
-HOST = "0.0.0.0"  # Nasłuchuj na wszystkich interfejsach
+# ====== KONFIGURACJA ======
+HOST = "0.0.0.0"
 PORT = 5005
+CAP_ID = 0  # Zmień na 1, jeśli masz kamerę USB
 
-# ====== KONFIGURACJA KAMERY ======
-# 0 to zazwyczaj kamera wbudowana. Jeśli masz USB, spróbuj 1.
-cap = cv2.VideoCapture(0)
+# Parametry wygładzania (zmniejszają drgania Haar Cascade)
+HISTORY_LEN = 5  # Średnia z ilu klatek? (Więcej = płynniej, ale wolniej)
 
-# Ładowanie detektora twarzy
-# Używamy standardowego haarcascade
+# ====== INICJALIZACJA ======
+cap = cv2.VideoCapture(CAP_ID)
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-# ====== START SERWERA ======
 server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 server_socket.bind((HOST, PORT))
 server_socket.listen(1)
 
-print(f"📡 Serwer czeka na połączenie na porcie {PORT}...")
-print(f"👉 Sprawdź IP tego laptopa (ipconfig) i wpisz je w Omniverse.")
-
+print(f"📡 Serwer (OpenCV Stable) nasłuchuje na porcie {PORT}...")
 conn, addr = server_socket.accept()
 print(f"✅ Połączono z: {addr}")
 
-# Pobieramy rozdzielczość kamery, żeby znaleźć środek
-ret, sample_frame = cap.read()
-if ret:
-    height, width, _ = sample_frame.shape
-    center_x_screen = width // 2
-    center_y_screen = height // 2
-else:
-    center_x_screen = 320
-    center_y_screen = 240
+# Bufory historii do wygładzania
+history_x = []
+history_y = []
+history_z = []
 
 try:
     while True:
         ret, frame = cap.read()
         if not ret: break
 
-        # Obracamy obraz (lustro), żeby ruch był intuicyjny
+        # Obracamy i konwertujemy na szary (szybciej)
         frame = cv2.flip(frame, 1)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Wykrywanie twarzy
+        faces = face_cascade.detectMultiScale(gray, 1.1, 5)
 
-        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-
-        data = {}
+        h, w_screen, _ = frame.shape
+        center_x_screen = w_screen // 2
+        center_y_screen = h // 2
+        
+        data = {"found": False}
 
         if len(faces) > 0:
-            # Bierzemy największą twarz (najbliższą)
-            (x, y, w, h) = max(faces, key=lambda f: f[2] * f[3])
-            
-            # --- KLUCZOWE OBLICZENIA ---
-            # Środek twarzy
-            face_center_x = x + w // 2
-            face_center_y = y + h // 2
-            
-            # Obliczamy przesunięcie od środka ekranu
-            offset_x = face_center_x - center_x_screen
-            offset_y = face_center_y - center_y_screen
-            
-            # Z = GŁĘBIA = SZEROKOŚĆ TWARZY (w)
-            # Im większe 'w', tym bliżej jesteś.
-            depth_z = float(w)
+            # Wybieramy największą twarz
+            (x, y, w, h_face) = max(faces, key=lambda f: f[2] * f[3])
 
-            # Rysujemy ramkę na podglądzie (Laptop)
-            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-            cv2.putText(frame, f"Z: {depth_z}", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            # Środek twarzy
+            curr_x = (x + w // 2) - center_x_screen
+            curr_y = (y + h_face // 2) - center_y_screen
+            curr_z = float(w) # Szerokość jako głębia
+
+            # --- FILTR WYGŁADZAJĄCY (Anti-Jitter) ---
+            history_x.append(curr_x)
+            history_y.append(curr_y)
+            history_z.append(curr_z)
+
+            if len(history_x) > HISTORY_LEN:
+                history_x.pop(0)
+                history_y.pop(0)
+                history_z.pop(0)
+
+            # Oblicz średnią
+            smooth_x = int(sum(history_x) / len(history_x))
+            smooth_y = int(sum(history_y) / len(history_y))
+            smooth_z = int(sum(history_z) / len(history_z))
 
             data = {
                 "found": True,
-                "x": int(offset_x),
-                "y": int(offset_y),
-                "z": int(depth_z)  # <--- To jest ta wartość, której brakowało
+                "x": smooth_x,
+                "y": smooth_y,
+                "z": smooth_z
             }
-            
-            # DEBUG W KONSOLI LAPTOPA
-            print(f"Wysyłam: X={offset_x}, Y={offset_y}, Z={depth_z}")
-            
+
+            # Rysowanie (wizualizacja)
+            cv2.rectangle(frame, (x, y), (x+w, y+h_face), (0, 255, 0), 2)
+            cv2.circle(frame, (x + w//2, y + h_face//2), 5, (0, 0, 255), -1)
+            cv2.putText(frame, f"Z: {smooth_z}", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+        
         else:
-            data = {"found": False}
-            # print("Nie widzę twarzy...")
+            # Jeśli zgubi twarz, czyścimy historię powoli
+            if len(history_x) > 0:
+                history_x.pop(0)
+                history_y.pop(0)
+                history_z.pop(0)
 
         # Wysyłanie JSON
-        message = json.dumps(data) + "\n"
         try:
-            conn.sendall(message.encode())
-        except:
-            print("❌ Klient rozłączony. Czekam ponownie...")
+            msg = json.dumps(data) + "\n"
+            conn.sendall(msg.encode())
+        except (BrokenPipeError, ConnectionResetError):
+            print("⚠️ Zerwano połączenie. Czekam...")
             conn, addr = server_socket.accept()
+            print("✅ Ponowne połączenie!")
 
-        # Pokaż okno z podglądem na laptopie
-        cv2.imshow('Tracker Twarzy', frame)
-        
-        # 'q' żeby wyjść
+        cv2.imshow('Tracker Twarzy (Stable)', frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
